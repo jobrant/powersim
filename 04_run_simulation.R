@@ -1,0 +1,622 @@
+#!/usr/bin/env Rscript
+
+# 04_run_simulation.R
+# Main orchestration script for the full simulation benchmark
+#
+# Usage:
+#   Rscript 04_run_simulation.R \
+#     --data_dir path/to/allc_files \
+#     --sample_sheet path/to/sample_sheet.csv \
+#     --output_dir results/simulation \
+#     --metilene_path metilene \
+#     --scenarios mild,moderate,severe \
+#     --seed 42
+#
+# Updated run_spikein_simulation for 04_run_simulation.R
+#
+# Key changes:
+# 1. Uses per-replicate efficiency vectors from get_efficiency_scenarios()
+# 2. rate_between_groups = FALSE (within-group normalization only)
+# 3. Dense region selection for spike-in placement
+
+
+# Configuration -----------------------------------------------------------
+
+#' Parse command line arguments or use defaults
+#'
+#' @param args Character vector of `--key value` pairs. Defaults to the process
+#'   command line; pass explicitly to build a config programmatically or to test
+#'   option handling without a subprocess.
+#' @export
+parse_args <- function(args = commandArgs(trailingOnly = TRUE)) {
+
+  # Defaults — adjust these to your local setup
+  config <- list(
+    data_dir      = "data/allc",
+    sample_sheet  = "data/sample_sheet.csv",
+    output_dir    = "results/simulation",
+    metilene_path = "/apps/metilene/0.2.8/metilene",
+    scenarios     = c("mild", "moderate", "severe"),
+    effect_sizes  = c(0.10, 0.15, 0.20, 0.30),
+    n_spikein_regions = 300,
+    region_width_bp   = 2000,
+    max_median_spacing = 200,
+    min_sites = 10, 
+    wt_group_id       = "PrEC",   # normal prostate epithelial cells (3 reps)
+    seed              = 42,
+    methods       = c("raw", "downsampled", "SMFnorm", "ComBatMet"),
+    metilene_max_dist = 300,
+    metilene_min_cpg  = 10,
+    # --- DMR significance -------------------------------------------------
+    # Significance and effect size are assessed SEPARATELY:
+    #   metilene runs with -d 0, so every tested segment is emitted;
+    #   Benjamini-Hochberg is then computed in R across ALL of them;
+    #   |mean_diff| is applied afterwards as its own criterion.
+    # Verified 2026-07-30 that metilene's -d filters OUTPUT ONLY (the -d 0.1
+    # segments are a strict subset of the -d 0 segments), so -d 0 yields the
+    # same tests unfiltered. On one comparison this took the BH denominator
+    # from 568 emitted segments to 32162 tested ones - the ~57x under-correction
+    # that made the old min_diff>0 + q_source="BH" combination anti-conservative.
+    metilene_min_diff = 0,      # metilene -d: 0 = emit every tested segment
+    metilene_min_effect = 0.1,  # R-side |mean_diff| cut, applied AFTER q filtering
+    metilene_qval     = 0.05,   # q-value cutoff for DMR significance
+    metilene_q_source = "BH",   # "BH" (R-side, full denominator) or "metilene" (col-4 q)
+    # VERIFIED 2026-07-30 via inst/scripts/diagnose_metilene_qvalues.R: metilene
+    # corrects the 2D-KS p-value (column 8), NOT the MWU p-value the manual
+    # claims. Backed out from a Bonferroni run: q/p_ks is constant at 985949
+    # (relative spread 1e-4), matching metilene's own "Number of Tests" line,
+    # while q/p_mwu ranges over ~1200 orders of magnitude.
+    metilene_p_column = "2dks",
+    metilene_mtc      = 2,   # metilene -c: 1 = Bonferroni, 2 = BH/FDR. Only affects
+                             # the stored q_metilene column; set to 2 so it differs
+                             # from q_bh by DENOMINATOR alone, as a cross-check.
+    within_alpha = 0.5,
+    between_alpha = 1.0,
+    min_coverage = 10,
+    dispersion_s = Inf,    # Beta precision for overdispersion; Inf = pure binomial
+    sim_mode = "parametric",    # pseudo-group construction: "clone" or "parametric"
+    rate_between_groups = FALSE  # SMFnorm: correct between-group rate differences
+  )
+
+  # Override from command line if provided.
+  #
+  # Keys are typed explicitly. Anything not listed here used to fall through to
+  # a raw character assignment, so `--within_alpha 0.5` silently produced the
+  # STRING "0.5" and then blew up as "non-numeric argument to binary operator"
+  # deep inside SMFnorm -- potentially hours into a multi-day run. Unknown keys
+  # were also silently ignored, so a typo ran the job at defaults.
+  int_keys  <- c("seed", "n_spikein_regions", "region_width_bp",
+                 "metilene_min_cpg", "metilene_max_dist", "min_coverage",
+                 "metilene_mtc", "min_sites", "max_median_spacing")
+  num_keys  <- c("metilene_min_diff", "dispersion_s", "metilene_qval",
+                 "within_alpha", "between_alpha", "metilene_min_effect")
+  flag_keys <- c("rate_between_groups", "standard_chr_only")
+  csv_keys  <- c("scenarios", "methods")
+  numvec_keys <- c("effect_sizes")
+
+  .as_flag <- function(x, key) {
+    v <- tolower(x)
+    if (v %in% c("true", "t", "yes", "1")) return(TRUE)
+    if (v %in% c("false", "f", "no", "0")) return(FALSE)
+    stop(sprintf("parse_args: --%s expects true/false, got '%s'.", key, x),
+         call. = FALSE)
+  }
+  .as_num <- function(x, key, integer = FALSE) {
+    v <- suppressWarnings(if (integer) as.integer(x) else as.numeric(x))
+    if (length(v) != 1L || is.na(v)) {
+      stop(sprintf("parse_args: --%s expects a %s, got '%s'.",
+                   key, if (integer) "whole number" else "number", x),
+           call. = FALSE)
+    }
+    v
+  }
+
+  i <- 1
+  while (i <= length(args)) {
+    key <- sub("^--", "", args[i])
+    if (i + 1 > length(args)) {
+      stop(sprintf("parse_args: --%s given with no value.", key), call. = FALSE)
+    }
+    val <- args[i + 1]
+
+    if (key %in% csv_keys) {
+      config[[key]] <- strsplit(val, ",")[[1]]
+    } else if (key %in% numvec_keys) {
+      config[[key]] <- vapply(strsplit(val, ",")[[1]], .as_num, numeric(1),
+                              key = key, USE.NAMES = FALSE)
+    } else if (key %in% int_keys) {
+      config[[key]] <- .as_num(val, key, integer = TRUE)
+    } else if (key %in% num_keys) {
+      config[[key]] <- .as_num(val, key)
+    } else if (key %in% flag_keys) {
+      config[[key]] <- .as_flag(val, key)
+    } else if (key %in% names(config)) {
+      config[[key]] <- val
+    } else {
+      stop(sprintf(paste0("parse_args: unknown option --%s. Valid options:\n  %s"),
+                   key, paste(sort(names(config)), collapse = ", ")),
+           call. = FALSE)
+    }
+    i <- i + 2
+  }
+
+  return(config)
+}
+
+
+# Data preparation --------------------------------------------------------
+
+#' Load WT replicates and prepare for simulation
+#'
+#' Non-standard contigs (e.g. `*_random`, `Un_*`) break the numeric site id used
+#' by `find_shared_sites()` and can leave replicates with mismatched row counts.
+#' By default this filters to standard chromosomes before shared-site filtering
+#' (override the pattern with `config$chr_pattern`, or disable with
+#' `config$standard_chr_only = FALSE`), then verifies all replicates are aligned.
+#'
+#' @param config Configuration list from parse_args().
+#' @return Named list of WT replicate data.tables (aligned, post shared-site
+#'   filtering).
+#' @export
+prepare_wt_replicates <- function(config) {
+  message("\n", strrep("=", 60))
+  message("STEP 0: Loading and preparing WT replicates")
+  message(strrep("=", 60))
+
+  # Apply min_coverage at read time so the coverage filter happens before any
+  # downstream step (standard-chr filter, find_shared_sites, pseudo-group
+  # construction). SMFnorm::load_data() filters each file as it is read, so the
+  # subsequent find_shared_sites() intersects already-filtered samples.
+  min_coverage <- config$min_coverage %||% 10L
+  if (min_coverage > 0) {
+    message(sprintf("Applying min_coverage = %d at load time", min_coverage))
+  }
+
+  # Load all data
+  all_samples <- load_data(
+    dir_path = config$data_dir,
+    sample_sheet = config$sample_sheet,
+    groups = config$wt_group_id,
+    min_coverage = min_coverage
+  )
+
+  message(sprintf("Loaded %d WT samples", length(all_samples)))
+
+  # Filter to standard chromosomes (autosomes + X/Y, with/without "chr").
+  # Mitochondrial (M/MT) is excluded by default: SMFnorm's .chr_to_int() has no
+  # mapping for it (NA-coercion warnings) and it is not wanted for DMR calling.
+  if (config$standard_chr_only %||% TRUE) {
+    pattern <- config$chr_pattern %||% "^(chr)?([0-9]{1,2}|X|Y)$"
+    n_before <- nrow(all_samples[[1]])
+    all_samples <- lapply(all_samples, function(dt) dt[grepl(pattern, chr)])
+    message(sprintf("Standard-chromosome filter: %d -> %d rows in sample 1",
+                    n_before, nrow(all_samples[[1]])))
+  }
+
+  # Find shared sites across WT replicates
+  all_samples <- find_shared_sites(all_samples, filter = TRUE)
+
+  # Verify alignment: downstream code (.pooled_rate, run_downsampled) assumes
+  # all replicates share the same sites in the same row order.
+  lens <- vapply(all_samples, nrow, integer(1))
+  if (length(unique(lens)) != 1L) {
+    stop(sprintf(
+      "Replicates are not aligned after find_shared_sites (rows: %s). Check for non-standard contigs or duplicate sites.",
+      paste(lens, collapse = ", ")))
+  }
+
+  message(sprintf("After shared-site filtering: %d sites per sample",
+                  nrow(all_samples[[1]])))
+
+  # Print summary
+  # summarize_meth(all_samples)
+
+  return(all_samples)
+}
+
+
+# Layer 1: Null simulation ------------------------------------------------
+
+#' Validate requested scenario names against the available set.
+#'
+#' Without this, an empty/unknown `config$scenarios` selects zero scenarios, the
+#' results table comes back column-less, and the downstream compile step fails
+#' with a cryptic "object 'scenario' not found". This turns that into a clear,
+#' actionable message naming the offending entries.
+#' @noRd
+.assert_known_scenarios <- function(requested, available) {
+  if (length(requested) == 0L) {
+    stop("config$scenarios is empty or NULL - no scenarios to run. ",
+         "Set it to a subset of: ", paste(available, collapse = ", "),
+         call. = FALSE)
+  }
+  bad <- setdiff(requested, available)
+  if (length(bad)) {
+    stop("Unknown scenario(s) in config$scenarios: ", paste(bad, collapse = ", "),
+         ".\n  Available scenarios are: ", paste(available, collapse = ", "),
+         ".\n  (If you expected these to exist, the running copy of ",
+         "get_efficiency_scenarios() is out of date.)", call. = FALSE)
+  }
+}
+
+#' Run the null simulation (false positive assessment)
+#'
+#' @param wt_reps Named list of WT replicate data.tables.
+#' @param config Configuration list.
+#' @return data.table of null simulation results (FP counts by scenario × method).
+#' @export
+run_null_simulation <- function(wt_reps, config) {
+  message("\n", strrep("=", 60))
+  message("LAYER 1: NULL SIMULATION (False Positive Assessment)")
+  message(strrep("=", 60))
+
+  scenarios <- get_efficiency_scenarios()
+  .assert_known_scenarios(config$scenarios, names(scenarios))
+  scenarios <- scenarios[config$scenarios]
+
+  null_results <- list()
+  # Per-scenario record of which methods could legitimately be applied. An
+  # inapplicable method produces no rows in the FP table, and a bare gap there
+  # reads as "scored zero". This makes the distinction explicit and auditable.
+  applicability <- list()
+
+  for (sc_name in names(scenarios)) {
+    sc <- scenarios[[sc_name]]
+    message(sprintf("\n--- Scenario: %s ---", sc$label))
+
+    # Create pseudo-groups with efficiency distortion (clone mode: 3 vs 3)
+    pseudo <- create_pseudo_groups(
+      replicates = wt_reps,
+      efficiency_A = sc$efficiency_A,
+      efficiency_B = sc$efficiency_B,
+      mode = config$sim_mode %||% "clone",
+      seed = config$seed,
+      dispersion_s = config$dispersion_s,
+      matched_means = isTRUE(sc$matched_means)
+    )
+
+    # Run all normalization methods
+    method_results <- run_all_methods(
+      pseudo_groups = pseudo,
+      methods = config$methods,
+      SMFnorm_params = list(
+        within_alpha = config$within_alpha,
+        between_alpha = config$between_alpha,
+        min_coverage = config$min_coverage %||% 10,
+        rate_between_groups = config$rate_between_groups %||% FALSE
+      )
+    )
+
+    applicability[[sc_name]] <- .applicability_rows(sc_name, config$methods,
+                                                    method_results)
+
+    # Call DMRs and classify for each method
+    null_results[[sc_name]] <- list()
+
+    for (m_name in names(method_results)) {
+      m_res <- method_results[[m_name]]
+
+      dmr_dir <- file.path(config$output_dir, "null", sc_name, m_name)
+
+      dmrs <- tryCatch({
+        call_dmrs_metilene(
+          split_data = m_res$data,
+          out_dir = dmr_dir,
+          metilene_path = config$metilene_path,
+          min_cpg = config$metilene_min_cpg,
+          min_diff = config$metilene_min_diff,
+          metilene_max_dist = config$metilene_max_dist,
+          q_cutoff = config$metilene_qval %||% 0.05,
+          q_source = config$metilene_q_source %||% "metilene",
+          p_column = config$metilene_p_column %||% "2dks",
+          min_effect = config$metilene_min_effect %||% 0,
+          mtc = config$metilene_mtc %||% 1
+        )
+      }, error = function(e) {
+        warning(sprintf("DMR calling failed for %s/%s: %s", sc_name, m_name, e$message))
+        data.table(chr = character(), start = integer(), end = integer(),
+                   q_value = numeric(), mean_diff = numeric(), n_sites = integer())
+      })
+
+      # In null simulation, all DMRs are FP
+      null_results[[sc_name]][[m_name]] <- classify_dmrs(
+        called_dmrs = dmrs,
+        truth_regions = NULL
+      )
+
+      message(sprintf("  %s: %d false positive DMRs", m_name, nrow(dmrs)))
+    }
+  }
+
+  # Compile results
+  .write_applicability(applicability, config$output_dir,
+                      "null_method_applicability.csv")
+
+  null_summary <- compile_null_results(null_results)
+  out_path <- file.path(config$output_dir, "null_simulation_results.csv")
+  fwrite(null_summary, out_path)
+  message(sprintf("\nNull simulation results saved to: %s", out_path))
+
+  return(null_summary)
+}
+
+
+# Layer 2: Spike-in simulation --------------------------------------------
+
+#' Run the spike-in simulation (sensitivity assessment)
+#'
+#' @param wt_reps Named list of WT replicate data.tables.
+#' @param config Configuration list.
+#' @return data.table of spike-in results by scenario × effect_size × method.
+#' @export
+run_spikein_simulation <- function(wt_reps, config) {
+  message("\n", strrep("=", 60))
+  message("LAYER 2: SPIKE-IN SIMULATION (Sensitivity Assessment)")
+  message(strrep("=", 60))
+  
+  scenarios <- get_efficiency_scenarios()
+  .assert_known_scenarios(config$scenarios, names(scenarios))
+  scenarios <- scenarios[config$scenarios]
+
+  sim_mode <- config$sim_mode %||% "clone"
+  message(sprintf("Spike-in construction mode: %s", sim_mode))
+
+  # Select spike-in regions once (same regions for all scenarios)
+  ref_dt <- wt_reps[[1]]
+  spikein_regions <- select_dense_spikein_regions(
+    dt = ref_dt,
+    n_regions = config$n_spikein_regions %||% 300,
+    region_width_bp = config$region_width_bp %||% 2000,
+    min_sites = config$min_sites %||% 10,
+    max_median_spacing = config$max_median_spacing %||% 200,
+    seed = config$seed + 1000
+  )
+  
+  # Fix data.table internal reference
+  spikein_regions <- spikein_regions[]
+  
+  # Save regions for reference
+  regions_path <- file.path(config$output_dir, "spikein_regions.csv")
+  dir.create(dirname(regions_path), recursive = TRUE, showWarnings = FALSE)
+  fwrite(spikein_regions, regions_path)
+  
+  all_results <- list()
+  applicability <- list()   # see run_null_simulation()
+  
+  for (sc_name in names(scenarios)) {
+    sc <- scenarios[[sc_name]]
+    message(sprintf("\n--- Scenario: %s ---", sc$label))
+    
+    for (effect in config$effect_sizes) {
+      result_key <- paste(sc_name, effect, sep = "_effect")
+      message(sprintf("\n  Effect size: %.2f", effect))
+      
+      n_reps <- length(wt_reps)
+      rep_names <- names(wt_reps)
+      
+      # Resolve per-replicate efficiencies. Seed first so range-based scenarios
+      # (which sample via runif) give the same efficiencies across effect sizes
+      # and are reproducible across runs.
+      set.seed(config$seed)
+      eff_A <- .resolve_efficiencies(sc$efficiency_A, n_reps, "A")
+      eff_B <- .resolve_efficiencies(sc$efficiency_B, n_reps, "B")
+
+      # This layer builds `pseudo` by hand rather than via
+      # create_pseudo_groups(), so repeat its matched-mean guard here. See that
+      # function for why a declared matched-mean scenario must stay matched.
+      eff_diff <- abs(mean(eff_A) - mean(eff_B))
+      if (isTRUE(sc$matched_means) && eff_diff > 1e-8) {
+        stop(sprintf(
+          paste0("run_spikein_simulation: scenario '%s' declares ",
+                 "matched_means = TRUE, but the realized efficiencies give a ",
+                 "between-group mean difference of %.4f.\n",
+                 "  A: %s  (mean %.4f)\n",
+                 "  B: %s  (mean %.4f)\n",
+                 "Rebalance the two vectors in get_efficiency_scenarios(), or ",
+                 "supply explicit length-%d vectors for both groups."),
+          sc_name, eff_diff,
+          paste(round(eff_A, 4), collapse = ", "), mean(eff_A),
+          paste(round(eff_B, 4), collapse = ", "), mean(eff_B),
+          n_reps), call. = FALSE)
+      }
+
+
+      if (sim_mode == "parametric") {
+        # Parametric: inject the effect into the pooled TRUE rate for group B,
+        # then draw both groups independently from their respective rates.
+        pooled_p <- .pooled_rate(wt_reps)
+        inj <- inject_spikein_parametric(
+          ref_dt = wt_reps[[1]],
+          p = pooled_p,
+          regions = spikein_regions,
+          effect_size = effect,
+          direction = "auto",
+          seed = config$seed + 2000
+        )
+
+        distorted_A <- mapply(function(dt, eff, i) {
+          .draw_parametric_rep(dt, pooled_p, eff,
+                               config$seed + 4000 + i, config$dispersion_s)
+        }, wt_reps, eff_A, seq_along(wt_reps), SIMPLIFY = FALSE)
+        names(distorted_A) <- paste0("PseudoA_", rep_names)
+
+        distorted_B <- mapply(function(dt, eff, i) {
+          .draw_parametric_rep(dt, inj$p, eff,
+                               config$seed + 5000 + i, config$dispersion_s)
+        }, wt_reps, eff_B, seq_along(wt_reps), SIMPLIFY = FALSE)
+        names(distorted_B) <- paste0("PseudoB_", rep_names)
+
+      } else {
+        # Clone: inject spike-ins into realized group-B counts BEFORE efficiency,
+        # then thin/resample both groups from the same source replicates.
+        reps_B_injected <- lapply(seq_len(n_reps), function(i) {
+          injection <- inject_spikein_dmrs(
+            dt = wt_reps[[i]],
+            regions = spikein_regions,
+            effect_size = effect,
+            direction = "auto",
+            seed = config$seed + 2000 + i
+          )
+          injection$data
+        })
+        names(reps_B_injected) <- rep_names
+
+        distorted_A <- mapply(function(dt, eff, i) {
+          simulate_efficiency(dt, eff, seed = config$seed + 4000 + i,
+                              dispersion_s = config$dispersion_s)
+        }, wt_reps, eff_A, seq_along(wt_reps), SIMPLIFY = FALSE)
+        names(distorted_A) <- paste0("PseudoA_", rep_names)
+
+        distorted_B <- mapply(function(dt, eff, i) {
+          simulate_efficiency(dt, eff, seed = config$seed + 5000 + i,
+                              dispersion_s = config$dispersion_s)
+        }, reps_B_injected, eff_B, seq_along(reps_B_injected), SIMPLIFY = FALSE)
+        names(distorted_B) <- paste0("PseudoB_", rep_names)
+      }
+      
+      pseudo <- list(
+        PseudoA = distorted_A,
+        PseudoB = distorted_B,
+        params = list(
+          efficiency_A = eff_A,
+          efficiency_B = eff_B,
+          effect_size = effect,
+          dispersion_s = config$dispersion_s,
+          sim_mode = sim_mode,
+          n_spikein_regions = nrow(spikein_regions)
+        )
+      )
+      
+      # Step 3: Run all normalization methods
+      method_results <- run_all_methods(
+        pseudo_groups = pseudo,
+        methods = config$methods,
+        SMFnorm_params = list(
+          within_alpha = config$within_alpha,
+          between_alpha = config$between_alpha,
+          min_coverage = config$min_coverage,
+          rate_between_groups = config$rate_between_groups %||% FALSE
+        )
+      )
+      
+      applicability[[result_key]] <- .applicability_rows(
+        result_key, config$methods, method_results)
+
+      # Step 4: Call DMRs and evaluate
+      all_results[[result_key]] <- list()
+      
+      for (m_name in names(method_results)) {
+        m_res <- method_results[[m_name]]
+        
+        dmr_dir <- file.path(config$output_dir, "spikein", sc_name,
+                             paste0("effect_", effect), m_name)
+        
+        dmrs <- tryCatch({
+          call_dmrs_metilene(
+            split_data = m_res$data,
+            out_dir = dmr_dir,
+            metilene_path = config$metilene_path,
+            min_cpg = config$metilene_min_cpg,
+            min_diff = config$metilene_min_diff,
+            metilene_max_dist = config$metilene_max_dist,
+            q_cutoff = config$metilene_qval %||% 0.05,
+            q_source = config$metilene_q_source %||% "metilene",
+            p_column = config$metilene_p_column %||% "2dks",
+            min_effect = config$metilene_min_effect %||% 0,
+            mtc = config$metilene_mtc %||% 1
+          )
+        }, error = function(e) {
+          warning(sprintf("DMR calling failed for %s/%s/effect%.2f: %s",
+                          sc_name, m_name, effect, e$message))
+          data.table(chr = character(), start = integer(), end = integer(),
+                     q_value = numeric(), mean_diff = numeric(), n_sites = integer())
+        })
+        
+        eval_result <- classify_dmrs(
+          called_dmrs = dmrs,
+          truth_regions = spikein_regions
+        )
+        
+        all_results[[result_key]][[m_name]] <- eval_result
+        metrics <- compute_metrics(eval_result$summary)
+        
+        message(sprintf(
+          "    %s: calls TP=%d FP=%d | regions det=%d/%d | sens=%.3f prec=%.3f F1=%.3f",
+          m_name, metrics$TP, metrics$FP,
+          metrics$regions_detected, metrics$n_regions,
+          metrics$sensitivity, metrics$precision, metrics$F1))
+      }
+    }
+  }
+  
+  # Compile results
+  .write_applicability(applicability, config$output_dir,
+                      "spikein_method_applicability.csv")
+
+  spikein_summary <- compile_results(all_results)
+  
+  # Parse scenario and effect size from the result key
+  spikein_summary[, c("efficiency_scenario", "effect_info") :=
+                    tstrsplit(scenario, "_effect", fixed = TRUE)]
+  spikein_summary[, effect_size := as.numeric(effect_info)]
+  spikein_summary[, effect_info := NULL]
+  
+  out_path <- file.path(config$output_dir, "spikein_simulation_results.csv")
+  fwrite(spikein_summary, out_path)
+  message(sprintf("\nSpike-in simulation results saved to: %s", out_path))
+  
+  return(spikein_summary)
+}
+
+# Null-coalescing operator
+`%||%` <- function(x, y) if (is.null(x)) y else x # now in R >= 4.4
+
+
+# Main entry point --------------------------------------------------------
+
+#' Run the full simulation benchmark
+#' 
+#' @export 
+main <- function() {
+  config <- parse_args()
+
+  message("Simulation Configuration:")
+  message(sprintf("  Data directory:   %s", config$data_dir))
+  message(sprintf("  Sample sheet:     %s", config$sample_sheet))
+  message(sprintf("  Output directory: %s", config$output_dir))
+  message(sprintf("  WT group:         %s", config$wt_group_id))
+  message(sprintf("  Scenarios:        %s", paste(config$scenarios, collapse = ", ")))
+  message(sprintf("  Methods:          %s", paste(config$methods, collapse = ", ")))
+  message(sprintf("  Effect sizes:     %s", paste(config$effect_sizes, collapse = ", ")))
+  message(sprintf("  Seed:             %d", config$seed))
+
+  # Create output directory
+  dir.create(config$output_dir, recursive = TRUE, showWarnings = FALSE)
+
+  # Save config for reproducibility
+  saveRDS(config, file.path(config$output_dir, "config.rds"))
+
+  # Load data
+  wt_reps <- prepare_wt_replicates(config)
+
+  # Run simulations
+  null_results   <- run_null_simulation(wt_reps, config)
+  spikein_results <- run_spikein_simulation(wt_reps, config)
+
+  # Save combined results
+  saveRDS(list(
+    null = null_results,
+    spikein = spikein_results,
+    config = config
+  ), file.path(config$output_dir, "all_results.rds"))
+
+  message("\n", strrep("=", 60))
+  message("SIMULATION COMPLETE")
+  message(strrep("=", 60))
+
+  message("\nNull simulation summary:")
+  print(null_results)
+
+  message("\nSpike-in simulation summary:")
+  print(spikein_results)
+}
