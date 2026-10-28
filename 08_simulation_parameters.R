@@ -1,4 +1,106 @@
 # Overdispersion --------------------------------------------
+# --- 1. Real overdispersion ----------------------------------------------
+
+# For each site: pooled rate p, observed across-rep variance of the rate, and
+# the Binomial expectation p(1-p) * mean(1/cov). Aggregated per rate bin with a
+# coverage-aware method-of-moments dispersion (rho) and precision (s = 1/rho-1).
+#
+# Model: rate_i ~ mean p, beta-binomial intra-class correlation rho, so
+#   Var(rate_i) = p(1-p) * [1/n_i + (1 - 1/n_i) * rho].
+# Solving the bin-level moment equation for rho:
+#   rho = (mean[s2] - mean[p(1-p)/n]) / mean[p(1-p)(1 - 1/n)].
+
+#' Estimate overdispersion across replicate methylation counts
+#'
+#' Computes observed variance in methylation rates across replicates and
+#' compares it with the expected Binomial variance. Groups sites into bins
+#' based on pooled methylation rates and estimates the variance inflation
+#' factor (VIF), Beta-binomial overdispersion (`rho`), and precision
+#' (`s = (1 - rho) / rho`). Estimates are also calculated across all sites.
+#' Sites with pooled rates of 0 or 1 are excluded.
+#'
+#' @param reps List of replicate datasets containing methylated counts (`mc`)
+#'   and coverages (`cov`).
+#' @param n_bins Number of bins used to group sites by pooled methylation rate.
+#' @return List containing `by_bin` (bin-level estimates), `overall`
+#'   (overall estimates), and `site` (site-level variance statistics).
+#' @export
+
+measure_overdispersion <- function(reps, n_bins = N_BINS) {
+  R <- length(reps)
+  if (R < 2) stop("Need >= 2 replicates to estimate overdispersion.")
+  
+  mc  <- .rep_matrix(reps, "mc")
+  cov <- .rep_matrix(reps, "cov")
+  rate <- mc / cov
+  
+  pooled_p <- rowSums(mc) / rowSums(cov)
+  obs_var  <- .row_var(rate)
+  mean_inv_cov <- rowMeans(1 / cov)
+  pq <- pooled_p * (1 - pooled_p)
+  binom_var <- pq * mean_inv_cov
+  
+  site <- data.table(
+    pooled_p = pooled_p,
+    obs_var = obs_var,
+    binom_var = binom_var,
+    pq = pq,
+    mean_inv_cov = mean_inv_cov,
+    mean_cov = rowMeans(cov),
+    bin = cut(pooled_p, breaks = seq(0, 1, length.out = n_bins + 1),
+              include.lowest = TRUE)
+  )
+  # Drop invariant sites (p = 0 or 1: no variance to explain).
+  site <- site[is.finite(obs_var) & pq > 0]
+  
+  by_bin <- site[, {
+    m_s2  <- mean(obs_var)
+    m_bin <- mean(binom_var)                       # mean p(1-p)/n
+    m_pq_within <- mean(pq * (1 - mean_inv_cov))   # mean p(1-p)(1 - 1/n)
+    rho <- (m_s2 - m_bin) / m_pq_within
+    rho <- max(min(rho, 0.999), 0)
+    .(
+      n_sites   = .N,
+      mid_rate  = mean(pooled_p),
+      mean_cov  = mean(mean_cov),
+      obs_var   = m_s2,
+      binom_var = m_bin,
+      VIF       = m_s2 / m_bin,                  # variance inflation factor
+      rho       = rho,
+      precision_s = if (rho > 0) (1 - rho) / rho else Inf
+    )
+  }, by = bin][order(mid_rate)]
+  
+  # Overall coverage-weighted moment estimate (weight by site count).
+  overall_rho <- site[, {
+    m_s2  <- mean(obs_var)
+    m_bin <- mean(binom_var)
+    m_pq_within <- mean(pq * (1 - mean_inv_cov))
+    max(min((m_s2 - m_bin) / m_pq_within, 0.999), 0)
+  }]
+  overall <- list(
+    n_sites = nrow(site),
+    median_VIF = median(site$obs_var / site$binom_var, na.rm = TRUE),
+    rho = overall_rho,
+    precision_s = if (overall_rho > 0) (1 - overall_rho) / overall_rho else Inf
+  )
+  
+  list(by_bin = by_bin, overall = overall, site = site)
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 #' Draw counts from a Beta-binomial (or Binomial) at a given mean rate
 #'
 #' For each element, draws `Binomial(size, p)` where `p = mean_rate` when `s` is
